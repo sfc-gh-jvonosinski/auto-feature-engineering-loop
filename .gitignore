@@ -1,0 +1,28 @@
+# Data files (large CSVs)
+data/*.csv
+data/*.gz
+
+# Loop state (resume file)
+state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Snowflake CLI cache
+.snowflake/
+
+# Matplotlib output
+*.png

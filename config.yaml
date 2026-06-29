@@ -1,0 +1,23 @@
+# Auto Feature Engineering Loop - Configuration
+# All user-tunable parameters in one place.
+
+snowflake:
+  connection_name: "DEMO_ACCT"
+  database: "AUTO_FEATURE_ENG"
+  schema: "CREDIT_RISK"
+  warehouse: "AICOLLEGE"
+  role: "ACCOUNTADMIN"
+
+agent:
+  model: "auto"          # "auto", "claude-sonnet-4-6", "claude-opus-4-6"
+  max_turns: 10          # limit agent exploration per iteration
+
+loop:
+  max_iterations: 20
+  improvement_threshold: 0.001   # min AUC delta to count as "keep"
+  pivot_threshold: 3             # stale iterations before forced category change
+  max_features_per_iter: 4
+
+cost:
+  max_cost_usd: 15.0             # total budget for the run
+  credit_rate_usd: 3.0           # dollars per Snowflake credit (for estimation)

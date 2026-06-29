@@ -1,0 +1,15 @@
+[project]
+name = "auto-feature-engineering"
+version = "0.1.0"
+description = "Autonomous feature engineering loop using Cortex Code Agent SDK"
+requires-python = ">=3.10"
+dependencies = [
+    "cortex-code-agent-sdk",
+    "snowflake-snowpark-python",
+    "snowflake-ml-python",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+streamlit = ["streamlit"]
