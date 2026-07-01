@@ -411,21 +411,21 @@ async def run_loop(config: dict, resume: bool = False):
         state["run_id"] = run_id
         print(f"Starting new run: {run_id}")
 
-    session = create_session(config)
-
-    # Set query tag for cost attribution
-    session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}'").collect()
-
-    # Establish baseline if first run
+    # Establish baseline if first run (short-lived session)
     if state["baseline_auc"] == 0.0:
         print("\n--- Establishing baseline ---")
-        baseline = train_and_evaluate(
-            session, "AUTO_FEATURE_ENG.CREDIT_RISK.RAW_CREDIT_DATA", -1, run_id
-        )
-        state["baseline_auc"] = baseline["auc"]
-        state["best_auc"] = baseline["auc"]
-        print(f"  Baseline AUC: {baseline['auc']:.6f}")
-        save_state(state)
+        session = create_session(config)
+        try:
+            session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}'").collect()
+            baseline = train_and_evaluate(
+                session, "AUTO_FEATURE_ENG.CREDIT_RISK.RAW_CREDIT_DATA", -1, run_id
+            )
+            state["baseline_auc"] = baseline["auc"]
+            state["best_auc"] = baseline["auc"]
+            print(f"  Baseline AUC: {baseline['auc']:.6f}")
+            save_state(state)
+        finally:
+            session.close()
 
     max_iter = config["loop"]["max_iterations"]
     print(f"\n{'='*60}")
@@ -443,46 +443,63 @@ async def run_loop(config: dict, resume: bool = False):
         t0 = time.time()
         sdk_cost = None
 
+        # Phase 1: SDK inference — no Snowpark session needed.
+        # The SDK manages its own connection internally.
+        print("  [Phase 1] Feature ideation (Cortex Code Agent SDK)...")
         try:
-            # 1. SDK CALL: Agent ideates features
-            print("  [Phase 1] Feature ideation (Cortex Code Agent SDK)...")
             feature_spec, sdk_cost = await ideate_features(i, state, config, project_dir)
             print(f"  [Phase 1] Got {len(feature_spec.get('features', []))} features, strategy: {feature_spec.get('strategy', '?')}")
-
-            # 2. DETERMINISTIC: Execute feature CTAS
-            print("  [Phase 2] Executing feature SQL...")
-            feat_table = execute_features(session, feature_spec, i, config)
-
-            # 3. DETERMINISTIC: Train and evaluate
-            print("  [Phase 3] Training model...")
-            metrics = train_and_evaluate(session, feat_table, i, run_id)
-            print(f"  [Phase 3] AUC: {metrics['auc']:.6f} (delta: {metrics['auc'] - state['best_auc']:+.6f})")
-
-            # 4. DETERMINISTIC: Decision
-            status = decide(metrics, state, config)
-            if status == "keep":
-                state["best_auc"] = metrics["auc"]
-                state["best_iter"] = i
-                state["stale_count"] = 0
-                # Track strategy that worked
-                strategy = feature_spec.get("strategy", "")
-                if strategy and strategy not in state["tried_categories"]:
-                    state["tried_categories"].append(strategy)
-                print(f"  ✓ KEEP — new best AUC: {metrics['auc']:.6f}")
-            else:
-                state["stale_count"] += 1
-                print(f"  ✗ DISCARD — no improvement (stale: {state['stale_count']})")
-
-            # 5. Log
-            log_iteration(session, i, run_id, feature_spec, metrics, status, state)
-
         except Exception as e:
-            print(f"  ✗ CRASH: {e}")
-            log_iteration(session, i, run_id, None, None, "crash", state, str(e)[:500])
+            print(f"  ✗ CRASH in ideation: {e}")
+            feature_spec = None
 
-        # 6. Log cost
-        duration = time.time() - t0
-        log_cost(session, i, run_id, sdk_cost, duration)
+        # Phases 2-6: Snowpark session for SQL operations.
+        # Session is created after inference completes and closed at end of iteration.
+        session = create_session(config)
+        try:
+            session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}'").collect()
+
+            if feature_spec is None:
+                # Ideation failed — log crash and continue
+                log_iteration(session, i, run_id, None, None, "crash", state, "Ideation failed")
+            else:
+                try:
+                    # 2. DETERMINISTIC: Execute feature CTAS
+                    print("  [Phase 2] Executing feature SQL...")
+                    feat_table = execute_features(session, feature_spec, i, config)
+
+                    # 3. DETERMINISTIC: Train and evaluate
+                    print("  [Phase 3] Training model...")
+                    metrics = train_and_evaluate(session, feat_table, i, run_id)
+                    print(f"  [Phase 3] AUC: {metrics['auc']:.6f} (delta: {metrics['auc'] - state['best_auc']:+.6f})")
+
+                    # 4. DETERMINISTIC: Decision
+                    status = decide(metrics, state, config)
+                    if status == "keep":
+                        state["best_auc"] = metrics["auc"]
+                        state["best_iter"] = i
+                        state["stale_count"] = 0
+                        strategy = feature_spec.get("strategy", "")
+                        if strategy and strategy not in state["tried_categories"]:
+                            state["tried_categories"].append(strategy)
+                        print(f"  ✓ KEEP — new best AUC: {metrics['auc']:.6f}")
+                    else:
+                        state["stale_count"] += 1
+                        print(f"  ✗ DISCARD — no improvement (stale: {state['stale_count']})")
+
+                    # 5. Log success
+                    log_iteration(session, i, run_id, feature_spec, metrics, status, state)
+
+                except Exception as e:
+                    print(f"  ✗ CRASH: {e}")
+                    log_iteration(session, i, run_id, None, None, "crash", state, str(e)[:500])
+
+            # 6. Log cost (always, including on crash)
+            duration = time.time() - t0
+            log_cost(session, i, run_id, sdk_cost, duration)
+
+        finally:
+            session.close()
 
         # Track cumulative cost
         if sdk_cost:
@@ -506,7 +523,6 @@ async def run_loop(config: dict, resume: bool = False):
     print(f"  Total cost:   ${state['total_cost_usd']:.4f}")
     print(f"{'='*60}")
 
-    session.close()
     return state
 
 
