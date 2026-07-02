@@ -26,6 +26,9 @@ from cortex_code_agent_sdk import (
 # Snowpark for deterministic data operations
 from snowflake.snowpark import Session
 
+# Snowflake ML — Feature Store and Model Registry
+from snowflake.ml.feature_store import FeatureStore, FeatureView, Entity, CreationMode
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -288,22 +291,30 @@ FROM {source_table}
 # Deterministic: Train and evaluate
 # ---------------------------------------------------------------------------
 
-def train_and_evaluate(session: Session, feature_table: str, iteration: int, run_id: str) -> dict:
-    """Call the fixed training stored procedure."""
-    print(f"  [Train] Calling TRAIN_AND_EVALUATE on {feature_table}...")
-    result = session.sql(f"""
+def train_and_evaluate(
+    session: Session,
+    feature_table: str,
+    iteration: int,
+    run_id: str,
+    register_model: bool = False,
+) -> dict:
+    """Call the training stored procedure. Optionally registers model in registry."""
+    reg_flag = "TRUE" if register_model else "FALSE"
+    print(f"  [Train] Calling TRAIN_AND_EVALUATE on {feature_table} (register={register_model})...")
+    session.sql(f"""
         CALL AUTO_FEATURE_ENG.CREDIT_RISK.TRAIN_AND_EVALUATE(
-            '{feature_table}', {iteration}, '{run_id}'
+            '{feature_table}', {iteration}, '{run_id}', {reg_flag}
         )
     """).collect()
 
     # Extract metrics from variant result
-    metrics_row = session.sql(f"""
+    metrics_row = session.sql("""
         SELECT
             $1:auc::FLOAT as auc,
             $1:ks_stat::FLOAT as ks_stat,
             $1:gini::FLOAT as gini,
-            $1:n_features::INT as n_features
+            $1:n_features::INT as n_features,
+            $1:model_version::VARCHAR as model_version
         FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
     """).collect()
 
@@ -311,12 +322,15 @@ def train_and_evaluate(session: Session, feature_table: str, iteration: int, run
         raise RuntimeError("Training SP returned no results")
 
     row = metrics_row[0]
-    return {
+    result = {
         "auc": float(row["AUC"]),
         "ks_stat": float(row["KS_STAT"]),
         "gini": float(row["GINI"]),
         "n_features": int(row["N_FEATURES"]),
     }
+    if row.get("MODEL_VERSION"):
+        result["model_version"] = row["MODEL_VERSION"]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +537,112 @@ async def run_loop(config: dict, resume: bool = False):
     print(f"  Total cost:   ${state['total_cost_usd']:.4f}")
     print(f"{'='*60}")
 
+    # Finalize: register best model and feature view
+    if state["best_iter"] >= 0:
+        finalize_run(state, config)
+
     return state
+
+
+# ---------------------------------------------------------------------------
+# Finalization: Feature Store + Model Registry
+# ---------------------------------------------------------------------------
+
+def finalize_run(state: dict, config: dict):
+    """
+    Post-loop finalization:
+    1. Re-train on best iteration's table with REGISTER_MODEL=TRUE (registers in Model Registry)
+    2. Register winning features in Snowflake Feature Store as an external Feature View
+    """
+    db = config["snowflake"]["database"]
+    schema = config["snowflake"]["schema"]
+    run_id = state["run_id"]
+    best_iter = state["best_iter"]
+    best_table = f"{db}.{schema}.FEATURES_ITER_{best_iter}"
+
+    print(f"\n{'─'*60}")
+    print(f"  FINALIZATION: Model Registry + Feature Store")
+    print(f"  Best iteration: {best_iter} (AUC: {state['best_auc']:.6f})")
+    print(f"  Feature table: {best_table}")
+    print(f"{'─'*60}")
+
+    session = create_session(config)
+    try:
+        session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}_finalize'").collect()
+
+        # --- Step 1: Register model via SP with REGISTER_MODEL=TRUE ---
+        print("\n  [Registry] Training final model and registering in Model Registry...")
+        final_metrics = train_and_evaluate(
+            session, best_table, best_iter, run_id, register_model=True
+        )
+        model_version = final_metrics.get("model_version", "unknown")
+        print(f"  [Registry] Model registered: CREDIT_RISK_XGBOOST version {model_version}")
+        print(f"  [Registry] AUC: {final_metrics['auc']:.6f}")
+
+        # --- Step 2: Register winning features in Feature Store ---
+        print("\n  [Feature Store] Registering winning features...")
+
+        # Ensure feature store schema exists
+        session.sql(f"CREATE SCHEMA IF NOT EXISTS {db}.FEATURE_STORE").collect()
+
+        fs = FeatureStore(
+            session=session,
+            database=db,
+            name="FEATURE_STORE",
+            default_warehouse=config["snowflake"]["warehouse"],
+            creation_mode=CreationMode.CREATE_IF_NOT_EXIST,
+        )
+
+        # Register BORROWER entity (idempotent — check if exists first)
+        try:
+            borrower_entity = fs.get_entity("BORROWER")
+        except Exception:
+            borrower_entity = Entity(
+                name="BORROWER",
+                join_keys=["ID"],
+                desc="Credit risk borrower, keyed by loan ID",
+            )
+            fs.register_entity(borrower_entity)
+
+        # Build feature DataFrame from the best iteration's table (exclude target + key)
+        feature_df = session.sql(f"""
+            SELECT *
+            EXCLUDE (SERIOUSDLQIN2YRS)
+            FROM {best_table}
+        """)
+
+        # Create external Feature View (no refresh — static snapshot)
+        fv_version = run_id.replace("-", "_").upper()
+        fv = FeatureView(
+            name="CREDIT_RISK_BEST_FV",
+            entities=[borrower_entity],
+            feature_df=feature_df,
+            refresh_freq=None,
+            desc=f"Best features from {run_id} iter {best_iter}, AUC={state['best_auc']:.6f}",
+        )
+
+        registered_fv = fs.register_feature_view(
+            feature_view=fv,
+            version=fv_version,
+            block=True,
+        )
+        print(f"  [Feature Store] Feature View registered: CREDIT_RISK_BEST_FV version {fv_version}")
+
+        # --- Summary ---
+        print(f"\n  {'─'*56}")
+        print(f"  FINALIZATION COMPLETE")
+        print(f"  Model:        AUTO_FEATURE_ENG.CREDIT_RISK.CREDIT_RISK_XGBOOST v{model_version}")
+        print(f"  Feature View: AUTO_FEATURE_ENG.FEATURE_STORE.CREDIT_RISK_BEST_FV v{fv_version}")
+        print(f"  {'─'*56}")
+        print(f"\n  Inference example:")
+        print(f"    SELECT MODEL(AUTO_FEATURE_ENG.CREDIT_RISK.CREDIT_RISK_XGBOOST, {model_version})!PREDICT(*)")
+        print(f"    FROM {best_table} LIMIT 10;")
+
+    except Exception as e:
+        print(f"  [Finalize] ERROR: {e}")
+        print("  The loop results are still valid — finalization can be retried.")
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------

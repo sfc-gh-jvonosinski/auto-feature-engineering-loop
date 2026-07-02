@@ -1,26 +1,29 @@
 -- Training and Evaluation Stored Procedure
 -- Fixed evaluator: trains XGBoost, returns AUC/KS/Gini + feature importances
+-- Optionally registers the trained model in Snowflake Model Registry.
 -- This procedure is NEVER modified by the agent loop.
 
 CREATE OR REPLACE PROCEDURE AUTO_FEATURE_ENG.CREDIT_RISK.TRAIN_AND_EVALUATE(
     FEATURE_TABLE_NAME VARCHAR,
     ITERATION_ID INT,
-    RUN_ID VARCHAR
+    RUN_ID VARCHAR,
+    REGISTER_MODEL BOOLEAN DEFAULT FALSE
 )
 RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python', 'xgboost', 'scikit-learn', 'numpy', 'scipy')
+PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python', 'xgboost', 'scikit-learn', 'numpy', 'scipy')
 HANDLER = 'run'
 AS $$
 import json
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 from scipy.stats import ks_2samp
 import xgboost as xgb
 
-def run(session, feature_table_name, iteration_id, run_id):
+def run(session, feature_table_name, iteration_id, run_id, register_model=False):
     # Load data
     df = session.table(feature_table_name).to_pandas()
     
@@ -71,7 +74,7 @@ def run(session, feature_table_name, iteration_id, run_id):
     ))
     top_features = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True)[:20])
     
-    return {
+    result = {
         "auc": round(auc, 6),
         "ks_stat": round(ks, 6),
         "gini": round(gini, 6),
@@ -80,4 +83,35 @@ def run(session, feature_table_name, iteration_id, run_id):
         "iteration_id": iteration_id,
         "run_id": run_id
     }
+    
+    # Register model in Snowflake Model Registry if requested
+    if register_model:
+        from snowflake.ml.registry import Registry
+
+        reg = Registry(
+            session=session,
+            database_name="AUTO_FEATURE_ENG",
+            schema_name="CREDIT_RISK",
+        )
+
+        # Use a subset of test data as sample input for schema inference
+        sample_input = pd.DataFrame(X_test.head(10))
+
+        # Version name must be a valid identifier (no hyphens)
+        version_name = run_id.replace("-", "_").upper()
+
+        mv = reg.log_model(
+            model,
+            model_name="CREDIT_RISK_XGBOOST",
+            version_name=version_name,
+            sample_input_data=sample_input,
+            conda_dependencies=["xgboost", "scikit-learn", "numpy", "scipy"],
+            target_platforms=["WAREHOUSE"],
+            comment=f"Auto Feature Eng iter {iteration_id}, AUC={auc:.6f}, features={len(feature_cols)}",
+        )
+
+        result["model_version"] = mv.version_name
+        result["model_name"] = "CREDIT_RISK_XGBOOST"
+
+    return result
 $$;
