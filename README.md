@@ -97,19 +97,46 @@ pip install streamlit
 streamlit run rollup.py
 ```
 
+### Dashboard (Research Cockpit)
+
+A Next.js web app for visualizing research progress in real time.
+
+```bash
+cd dashboard
+npm install
+npm run dev
+# Open http://localhost:3000
+```
+
+The dashboard reads from the same `FEATURE_LOG`, `COST_LOG`, and Model Registry tables that the loop writes to. It shows:
+- KPI strip (champion AUC, improvement, cost, signals accepted)
+- Experiment timeline with clickable iteration dots
+- Model performance charts (AUC/KS/Gini with baseline + champion)
+- Cost accumulation (per-iteration + cumulative)
+- Signal leaderboard ranked by AUC contribution
+- Iteration detail drawer (metrics, SQL, agent reasoning)
+- Governance checklist (model registry, validation, fairness, human approval)
+
 ## Project Structure
 
 ```
 ├── main_loop.py              # Orchestrator (Cortex Code Agent SDK + deterministic loop)
 ├── program.md                # Agent system prompt (domain context, SQL rules)
 ├── config.yaml               # All tunable parameters
-├── rollup.py                 # Visual results summary
+├── rollup.py                 # Visual results summary (CLI + Streamlit)
 ├── setup/
 │   ├── create_schema.sql     # DDL reference (auto-applied by main_loop.py)
 │   ├── create_procedures.sql # SP reference (auto-applied by main_loop.py)
 │   └── create_feature_store.sql # Feature Store schema (auto-applied)
 ├── data/
 │   └── cs-training.csv       # Give Me Some Credit dataset (bundled, auto-loaded)
+├── dashboard/                # AI Credit Model Research Cockpit (Next.js Snowflake App)
+│   ├── app/                  # Next.js pages + API routes
+│   ├── components/           # React UI components (charts, KPI strip, leaderboard)
+│   ├── lib/                  # Snowflake query helper, constants
+│   ├── package.json          # Node dependencies
+│   ├── app.yml               # Snowflake App profile metadata
+│   └── icon.svg              # App icon
 ├── utils/
 │   └── cost_tracker.py       # Post-run cost reconciliation
 ├── pyproject.toml            # Python dependencies

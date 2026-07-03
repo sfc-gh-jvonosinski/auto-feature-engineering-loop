@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <rect width="64" height="64" rx="12" fill="#0f172a"/>
+  <path d="M12 44 L22 28 L32 36 L42 20 L52 24" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M12 44 L22 28 L32 36 L42 20 L52 24 L52 50 L12 50 Z" fill="url(#grad)" opacity="0.15"/>
+  <circle cx="42" cy="20" r="3" fill="#8b5cf6"/>
+  <circle cx="52" cy="24" r="2" fill="#3b82f6"/>
+  <path d="M16 52 L16 46" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
+  <path d="M24 52 L24 42" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
+  <path d="M32 52 L32 44" stroke="#10b981" stroke-width="3" stroke-linecap="round"/>
+  <path d="M40 52 L40 38" stroke="#10b981" stroke-width="3" stroke-linecap="round"/>
+  <path d="M48 52 L48 40" stroke="#3b82f6" stroke-width="3" stroke-linecap="round"/>
+  <text x="14" y="16" font-family="monospace" font-size="7" fill="#64748b">AI</text>
+  <defs>
+    <linearGradient id="grad" x1="12" y1="20" x2="12" y2="50">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+</svg>

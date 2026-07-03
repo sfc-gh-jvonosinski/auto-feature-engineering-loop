@@ -1,0 +1,7 @@
+run:
+  command: ["node", ".next/standalone/server.js"]
+
+profile:
+  label: "AI Credit Model Research Cockpit"
+  description: "Autonomous feature discovery and XGBoost training progress dashboard for sub-prime credit risk"
+  icon: icon.svg

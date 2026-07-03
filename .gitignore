@@ -13,6 +13,12 @@ __pycache__/
 .venv/
 venv/
 
+# Dashboard (Next.js)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+*.tsbuildinfo
+
 # IDE
 .idea/
 .vscode/
