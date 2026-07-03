@@ -37,9 +37,8 @@ Starting from a **baseline AUC of 0.862** on 10 raw features, the loop explores 
 - Python 3.10+
 - [Cortex Code CLI](https://docs.snowflake.com/en/user-guide/cortex-code-agent-sdk/cortex-code-agent-sdk) installed
 - Snowflake account with a connection configured in `~/.snowflake/connections.toml`
-- Kaggle "Give Me Some Credit" dataset (`cs-training.csv`)
 
-### Setup
+### Run (one command)
 
 ```bash
 # 1. Install dependencies
@@ -48,19 +47,19 @@ pip install cortex-code-agent-sdk snowflake-snowpark-python snowflake-ml-python 
 # 2. Configure your Snowflake connection in config.yaml
 #    (update connection_name, warehouse, role as needed)
 
-# 3. Create Snowflake objects (run once)
-#    Execute setup/create_schema.sql and setup/create_procedures.sql
-#    in your Snowflake account
-
-# 4. Load data
-#    PUT file://data/cs-training.csv @AUTO_FEATURE_ENG.CREDIT_RISK.CREDIT_DATA_STAGE
-#    COPY INTO RAW_CREDIT_DATA ... (see setup/create_schema.sql)
-
-# 5. Run the loop
+# 3. Run — everything else is automatic
 python main_loop.py --max-iterations 20
 ```
 
-The first run will prompt for OAuth browser authentication (one-time). Subsequent runs use the cached token.
+On first run, `main_loop.py` automatically:
+1. Creates the database, schemas, tables, stage, and stored procedure (idempotent)
+2. Loads the bundled sample data (`data/cs-training.csv`) into Snowflake
+3. Establishes a baseline model
+4. Runs the feature engineering loop
+5. Registers the best model in **Snowflake Model Registry**
+6. Registers winning features in **Snowflake Feature Store**
+
+No manual SQL setup needed — just run the script.
 
 ### Configuration
 
@@ -106,12 +105,13 @@ streamlit run rollup.py
 ├── config.yaml               # All tunable parameters
 ├── rollup.py                 # Visual results summary
 ├── setup/
-│   ├── create_schema.sql     # DDL for database, tables, stage
-│   └── create_procedures.sql # TRAIN_AND_EVALUATE stored procedure
+│   ├── create_schema.sql     # DDL reference (auto-applied by main_loop.py)
+│   ├── create_procedures.sql # SP reference (auto-applied by main_loop.py)
+│   └── create_feature_store.sql # Feature Store schema (auto-applied)
+├── data/
+│   └── cs-training.csv       # Give Me Some Credit dataset (bundled, auto-loaded)
 ├── utils/
 │   └── cost_tracker.py       # Post-run cost reconciliation
-├── data/
-│   └── cs-training.csv       # Give Me Some Credit dataset (not committed)
 ├── pyproject.toml            # Python dependencies
 └── state.json                # Loop state for resume (gitignored)
 ```
@@ -143,6 +143,7 @@ The orchestrator then deterministically:
 | Cortex Code Agent SDK | Feature ideation with autonomous SQL exploration |
 | Structured Output | Validated JSON responses from the agent |
 | Model Registry | Version and serve the best model |
+| Feature Store | Managed feature views with lineage and versioning |
 | Stored Procedures | Fixed XGBoost training harness |
 | Query Tagging | Cost attribution per iteration |
 | ACCOUNT_USAGE views | Post-run cost reconciliation |

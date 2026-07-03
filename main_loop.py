@@ -312,6 +312,33 @@ AS $${_SP_BODY}$$"""
 
     print("  [Setup] Infrastructure ready.")
 
+    # Load sample data if table is empty
+    row_count = session.sql(f"SELECT COUNT(*) AS N FROM {db}.{schema}.RAW_CREDIT_DATA").collect()
+    if row_count[0]["N"] == 0:
+        data_file = Path(__file__).parent / "data" / "cs-training.csv"
+        if data_file.exists():
+            print("  [Setup] Loading sample data (cs-training.csv)...")
+            stage = f"{db}.{schema}.CREDIT_DATA_STAGE"
+            session.sql(f"REMOVE @{stage}").collect()
+            session.file.put(
+                str(data_file), f"@{stage}", auto_compress=False, overwrite=True
+            )
+            session.sql(f"""
+                COPY INTO {db}.{schema}.RAW_CREDIT_DATA
+                FROM @{stage}/cs-training.csv
+                FILE_FORMAT = (
+                    TYPE = 'CSV'
+                    SKIP_HEADER = 1
+                    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+                )
+                ON_ERROR = 'CONTINUE'
+            """).collect()
+            loaded = session.sql(f"SELECT COUNT(*) AS N FROM {db}.{schema}.RAW_CREDIT_DATA").collect()
+            print(f"  [Setup] Loaded {loaded[0]['N']:,} rows into RAW_CREDIT_DATA.")
+        else:
+            print(f"  [Setup] WARNING: RAW_CREDIT_DATA is empty and data/cs-training.csv not found.")
+            print(f"           Place the Kaggle 'Give Me Some Credit' CSV at: {data_file}")
+
 
 # ---------------------------------------------------------------------------
 # Feature ideation via Cortex Code Agent SDK

@@ -1,6 +1,7 @@
-# Data files (large CSVs)
+# Data files (large CSVs) — except the bundled sample data
 data/*.csv
 data/*.gz
+!data/cs-training.csv
 
 # Loop state (resume file)
 state.json
