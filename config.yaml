@@ -20,4 +20,4 @@ loop:
 
 cost:
   max_cost_usd: 15.0             # total budget for the run
-  credit_rate_usd: 3.0           # dollars per Snowflake credit (for estimation)
+  credit_rate_usd: 3.0           # dollars per Snowflake credit

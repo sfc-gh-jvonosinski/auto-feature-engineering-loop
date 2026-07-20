@@ -9,6 +9,7 @@ dependencies = [
     "snowflake-ml-python",
     "pyyaml",
     "matplotlib",
+    "rich>=13.0",
 ]
 
 [project.optional-dependencies]

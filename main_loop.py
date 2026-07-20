@@ -8,9 +8,14 @@ Usage:
     python main_loop.py                    # run with defaults (20 iterations)
     python main_loop.py --max-iterations 5 # override max iterations
     python main_loop.py --resume           # resume a previous run
+    python main_loop.py -v                 # verbose (show agent reasoning)
+    python main_loop.py -q                 # quiet (decisions and errors only)
+    python main_loop.py --no-live          # disable rich status panel (CI/pipes)
 """
 import asyncio
 import json
+import logging
+import logging.handlers
 import time
 import argparse
 from pathlib import Path
@@ -29,6 +34,152 @@ from snowflake.snowpark import Session
 # Snowflake ML — Feature Store and Model Registry
 from snowflake.ml.feature_store import FeatureStore, FeatureView, Entity, CreationMode
 
+# Rich — optional terminal status panel
+try:
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.console import Console
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+# ---------------------------------------------------------------------------
+# Logging setup (Snowflake-aligned: Python logging module with extra attrs)
+# ---------------------------------------------------------------------------
+
+def setup_logging(run_id: str, verbosity: str = "normal") -> logging.Logger:
+    """
+    Configure logging with file + console handlers.
+
+    Uses Python's logging module — the same API Snowflake uses in stored
+    procedures and event tables. Structured extra={} attributes map to
+    RECORD_ATTRIBUTES in Snowflake event tables if ported to server-side.
+    """
+    logger = logging.getLogger("auto_fe")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    # Ensure logs/ directory exists
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    # File handler — persistent, rotated, captures everything
+    fh = logging.handlers.RotatingFileHandler(
+        log_dir / f"{run_id}.log", maxBytes=5_000_000, backupCount=3
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(fh)
+
+    # Console handler — respects verbosity
+    ch = logging.StreamHandler()
+    level_map = {"verbose": logging.DEBUG, "normal": logging.INFO, "quiet": logging.WARNING}
+    ch.setLevel(level_map.get(verbosity, logging.INFO))
+    ch.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(ch)
+
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# Live terminal status panel (rich)
+# ---------------------------------------------------------------------------
+
+class LoopMonitor:
+    """Auto-updating terminal status panel using rich.live.Live.
+
+    Renders a live panel to stderr showing current iteration, best AUC,
+    stale count, cost, and the last 4 iteration outcomes. Falls back to
+    _NoOpMonitor when rich is unavailable or --no-live is set.
+    """
+
+    def __init__(self, run_id: str, max_iter: int, cost_ceiling: float, enabled: bool = True):
+        self.run_id = run_id
+        self.max_iter = max_iter
+        self.cost_ceiling = cost_ceiling
+        self.current_iter = 0
+        self.phase = "setup"
+        self.best_auc = 0.0
+        self.best_iter = -1
+        self.stale_count = 0
+        self.cost_usd = 0.0
+        self.iter_start = time.time()
+        self.run_start = time.time()
+        self.history: list[tuple[int, str, float, str]] = []  # (iter, status, auc, strategy)
+        self.enabled = enabled and HAS_RICH
+        self._live = None
+
+    def start(self):
+        if self.enabled:
+            self._live = Live(
+                self._render(),
+                console=Console(stderr=True),
+                refresh_per_second=2,
+                transient=True,
+            )
+            self._live.start()
+
+    def stop(self):
+        if self._live:
+            self._live.stop()
+            self._live = None
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        if self._live:
+            self._live.update(self._render())
+
+    def add_history(self, iteration: int, status: str, auc: float, strategy: str):
+        self.history.append((iteration, status, auc, strategy))
+        if len(self.history) > 5:
+            self.history = self.history[-5:]
+
+    def _render(self) -> Panel:
+        elapsed = time.time() - self.iter_start
+        total_elapsed = time.time() - self.run_start
+        mins, secs = divmod(int(elapsed), 60)
+        t_mins, t_secs = divmod(int(total_elapsed), 60)
+
+        # Status line
+        lines = []
+        lines.append(
+            f" Run: {self.run_id} | Iter: {self.current_iter}/{self.max_iter} "
+            f"| Phase: {self.phase} | {mins}:{secs:02d} iter / {t_mins}:{t_secs:02d} total"
+        )
+        lines.append(
+            f" Best AUC: {self.best_auc:.6f} (iter {self.best_iter}) "
+            f"| Stale: {self.stale_count} "
+            f"| Cost: ${self.cost_usd:.2f} / ${self.cost_ceiling:.2f}"
+        )
+
+        # History row
+        if self.history:
+            hist_parts = []
+            for (it, st, auc, strat) in self.history[-4:]:
+                icon = "\u2713" if st == "keep" else "\u2717" if st == "discard" else "!"
+                hist_parts.append(f"#{it+1} {icon} {auc:.4f} {strat[:12]}")
+            lines.append(" " + " | ".join(hist_parts))
+
+        content = Text("\n".join(lines))
+        return Panel(content, title="Auto Feature Eng Loop", border_style="blue")
+
+
+class _NoOpMonitor:
+    """Fallback when rich is unavailable or --no-live is set."""
+    def start(self): pass
+    def stop(self): pass
+    def update(self, **kwargs): pass
+    def add_history(self, *args, **kwargs): pass
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -41,17 +192,17 @@ DEFAULT_CONFIG = {
     },
     "agent": {
         "model": "auto",
-        "max_turns": 10,
+        "max_turns": 10,  # max SDK back-and-forth turns per ideation call
     },
     "loop": {
         "max_iterations": 20,
-        "improvement_threshold": 0.001,
-        "pivot_threshold": 3,
+        "improvement_threshold": 0.001,  # min AUC delta to accept a feature set
+        "pivot_threshold": 3,            # stale iterations before forcing a strategy pivot
         "max_features_per_iter": 4,
     },
     "cost": {
         "max_cost_usd": 15.0,
-        "credit_rate_usd": 3.0,
+        "credit_rate_usd": 3.0,  # USD per Snowflake credit, used for cost estimation
     },
 }
 
@@ -81,6 +232,7 @@ STATE_FILE = Path(__file__).parent / "state.json"
 
 
 def load_state(run_id: str) -> dict:
+    # "__resume__" is a sentinel: load whatever run is saved regardless of ID
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
             state = json.load(f)
@@ -118,6 +270,7 @@ def create_session(config: dict) -> Session:
         "schema": sf_cfg["schema"],
         "warehouse": sf_cfg["warehouse"],
         "role": sf_cfg.get("role", "ACCOUNTADMIN"),
+        "client_store_temporary_credential": True,
     })
     return builder.create()
 
@@ -149,6 +302,8 @@ def run(session, feature_table_name, iteration_id, run_id, register_model=False)
         X, y, test_size=0.2, stratify=y, random_state=42
     )
 
+    # Compute class-imbalance weight: XGBoost scale_pos_weight = neg/pos
+    # so the minority default class is up-weighted during training.
     pos_count = int(y_train.sum())
     neg_count = int(len(y_train) - pos_count)
     scale_pos = neg_count / max(pos_count, 1)
@@ -224,10 +379,11 @@ def ensure_infrastructure(session: Session, config: dict):
     Idempotently create all Snowflake objects needed for the loop.
     Safe to call on every run — uses IF NOT EXISTS / CREATE OR REPLACE.
     """
+    logger = logging.getLogger("auto_fe")
     db = config["snowflake"]["database"]
     schema = config["snowflake"]["schema"]
 
-    print("  [Setup] Ensuring infrastructure exists...")
+    logger.info("[Setup] Ensuring infrastructure exists...")
 
     # Database and schemas
     session.sql(f"CREATE DATABASE IF NOT EXISTS {db}").collect()
@@ -294,7 +450,12 @@ def ensure_infrastructure(session: Session, config: dict):
         FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"')
     """).collect()
 
-    # Stored procedure (CREATE OR REPLACE — always ensures latest version)
+    # Drop both known SP overloads before recreating — Snowflake procedures are
+    # identified by their full signature, so an updated signature would otherwise
+    # leave the old overload orphaned.
+    session.sql(f"DROP PROCEDURE IF EXISTS {db}.{schema}.TRAIN_AND_EVALUATE(VARCHAR, INT, VARCHAR)").collect()
+    session.sql(f"DROP PROCEDURE IF EXISTS {db}.{schema}.TRAIN_AND_EVALUATE(VARCHAR, INT, VARCHAR, BOOLEAN)").collect()
+
     sp_sql = f"""
 CREATE OR REPLACE PROCEDURE {db}.{schema}.TRAIN_AND_EVALUATE(
     FEATURE_TABLE_NAME VARCHAR,
@@ -310,14 +471,14 @@ HANDLER = 'run'
 AS $${_SP_BODY}$$"""
     session.sql(sp_sql).collect()
 
-    print("  [Setup] Infrastructure ready.")
+    logger.info("[Setup] Infrastructure ready.")
 
     # Load sample data if table is empty
     row_count = session.sql(f"SELECT COUNT(*) AS N FROM {db}.{schema}.RAW_CREDIT_DATA").collect()
     if row_count[0]["N"] == 0:
         data_file = Path(__file__).parent / "data" / "cs-training.csv"
         if data_file.exists():
-            print("  [Setup] Loading sample data (cs-training.csv)...")
+            logger.info("[Setup] Loading sample data (cs-training.csv)...")
             stage = f"{db}.{schema}.CREDIT_DATA_STAGE"
             session.sql(f"REMOVE @{stage}").collect()
             session.file.put(
@@ -334,16 +495,18 @@ AS $${_SP_BODY}$$"""
                 ON_ERROR = 'CONTINUE'
             """).collect()
             loaded = session.sql(f"SELECT COUNT(*) AS N FROM {db}.{schema}.RAW_CREDIT_DATA").collect()
-            print(f"  [Setup] Loaded {loaded[0]['N']:,} rows into RAW_CREDIT_DATA.")
+            logger.info(f"[Setup] Loaded {loaded[0]['N']:,} rows into RAW_CREDIT_DATA.")
         else:
-            print(f"  [Setup] WARNING: RAW_CREDIT_DATA is empty and data/cs-training.csv not found.")
-            print(f"           Place the Kaggle 'Give Me Some Credit' CSV at: {data_file}")
+            logger.warning(f"[Setup] RAW_CREDIT_DATA is empty and data/cs-training.csv not found.")
+            logger.warning(f"[Setup] Place the Kaggle 'Give Me Some Credit' CSV at: {data_file}")
 
 
 # ---------------------------------------------------------------------------
 # Feature ideation via Cortex Code Agent SDK
 # ---------------------------------------------------------------------------
 
+# JSON schema that constrains the agent's output — enforces structured feature proposals
+# so downstream SQL generation is reliable without any parsing heuristics.
 FEATURE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -377,6 +540,7 @@ async def ideate_features(
     The agent can run SQL to explore data and read the feature log.
     Returns (feature_spec, sdk_cost_info).
     """
+    logger = logging.getLogger("auto_fe")
     stale_count = state.get("stale_count", 0)
     best_auc = state.get("best_auc", 0)
     run_id = state["run_id"]
@@ -429,23 +593,24 @@ Read program.md in the current directory for additional context on feature categ
     sdk_cost = {"usd": 0.0, "tokens_in": 0, "tokens_out": 0, "duration_ms": 0}
     result_data = None
 
+    # Stream SDK messages; the agent runs SQL against Snowflake and reads files
+    # before emitting a final ResultMessage with the structured feature spec.
+    # bypassPermissions lets it execute tools without interactive prompts.
     async for msg in query(
         prompt=prompt,
         options=CortexCodeAgentOptions(
             cwd=str(project_dir),
             model=config["agent"]["model"],
             max_turns=config["agent"]["max_turns"],
-            output_format={"type": "json_schema", "schema": FEATURE_SCHEMA},
+            output_format={"type": "json_schema", "schema": FEATURE_SCHEMA},  # constrained generation
             permission_mode="bypassPermissions",
             allow_dangerously_skip_permissions=True,
         ),
     ):
         if isinstance(msg, AssistantMessage):
-            # Agent is working (running SQL, reading files, reasoning)
             for block in msg.content:
                 if hasattr(block, "text") and block.text:
-                    # Print agent's reasoning for visibility
-                    print(f"  [Agent] {block.text[:200]}")
+                    logger.debug(f"[Agent] {block.text[:200]}")
         elif isinstance(msg, ResultMessage):
             sdk_cost["usd"] = msg.total_cost_usd or 0.0
             sdk_cost["tokens_in"] = (msg.usage or {}).get("input_tokens", 0)
@@ -465,6 +630,7 @@ Read program.md in the current directory for additional context on feature categ
 
 def execute_features(session: Session, feature_spec: dict, iteration: int, config: dict) -> str:
     """Build and execute CTAS to create the feature table."""
+    logger = logging.getLogger("auto_fe")
     db = config["snowflake"]["database"]
     schema = config["snowflake"]["schema"]
     source_table = f"{db}.{schema}.RAW_CREDIT_DATA"
@@ -497,7 +663,7 @@ SELECT
 {new_features_sql}
 FROM {source_table}
 """
-    print(f"  [SQL] Creating {output_table} with {len(feature_spec.get('features', []))} new features...")
+    logger.debug(f"[SQL] CTAS:\n{ctas_sql}")
     try:
         session.sql(ctas_sql).collect()
         return output_table
@@ -517,15 +683,17 @@ def train_and_evaluate(
     register_model: bool = False,
 ) -> dict:
     """Call the training stored procedure. Optionally registers model in registry."""
+    logger = logging.getLogger("auto_fe")
     reg_flag = "TRUE" if register_model else "FALSE"
-    print(f"  [Train] Calling TRAIN_AND_EVALUATE on {feature_table} (register={register_model})...")
+    logger.debug(f"[Train] Calling TRAIN_AND_EVALUATE on {feature_table} (register={register_model})...")
     session.sql(f"""
         CALL AUTO_FEATURE_ENG.CREDIT_RISK.TRAIN_AND_EVALUATE(
             '{feature_table}', {iteration}, '{run_id}', {reg_flag}
         )
     """).collect()
 
-    # Extract metrics from variant result
+    # RESULT_SCAN(LAST_QUERY_ID()) reads the VARIANT return value of the CALL
+    # statement as a queryable table row, avoiding a second round-trip.
     metrics_row = session.sql("""
         SELECT
             $1:auc::FLOAT as auc,
@@ -546,7 +714,7 @@ def train_and_evaluate(
         "gini": float(row["GINI"]),
         "n_features": int(row["N_FEATURES"]),
     }
-    if row.get("MODEL_VERSION"):
+    if row["MODEL_VERSION"] is not None:
         result["model_version"] = row["MODEL_VERSION"]
     return result
 
@@ -579,26 +747,28 @@ def log_iteration(
 ):
     """Log iteration results to FEATURE_LOG."""
     features_json = json.dumps(feature_spec.get("features", [])) if feature_spec else "[]"
-    strategy = feature_spec.get("strategy", "") if feature_spec else ""
-    reasoning = feature_spec.get("reasoning", "") if feature_spec else ""
+    strategy = (feature_spec.get("strategy", "") if feature_spec else "")[:200].replace("'", "")
+    reasoning = (feature_spec.get("reasoning", "") if feature_spec else "")[:500].replace("'", "")
+    error_msg_clean = error_msg[:500].replace("'", "")
     auc = metrics["auc"] if metrics else 0.0
     ks = metrics["ks_stat"] if metrics else 0.0
     gini = metrics["gini"] if metrics else 0.0
     n_feat = metrics["n_features"] if metrics else 0
     delta = auc - state["best_auc"] if metrics else 0.0
 
+    # Dollar-quoting ($$...$$) safely embeds the JSON string without escaping
+    # every double-quote, and PARSE_JSON converts it to a Snowflake VARIANT.
     session.sql(f"""
         INSERT INTO AUTO_FEATURE_ENG.CREDIT_RISK.FEATURE_LOG
         (ITERATION_ID, RUN_ID, FEATURE_TABLE, FEATURES_ADDED, NUM_FEATURES,
          AUC, KS_STAT, GINI, DELTA_AUC, STATUS, STRATEGY, REASONING, ERROR_MSG)
-        VALUES (
+        SELECT
             {iteration}, '{run_id}', 'FEATURES_ITER_{iteration}',
             PARSE_JSON($${features_json}$$),
             {n_feat}, {auc}, {ks}, {gini}, {delta},
-            '{status}', '{strategy[:200]}',
-            '{reasoning[:500].replace(chr(39), "")}',
-            '{error_msg[:500].replace(chr(39), "")}'
-        )
+            '{status}', '{strategy}',
+            '{reasoning}',
+            '{error_msg_clean}'
     """).collect()
 
 
@@ -608,8 +778,10 @@ def log_cost(
     run_id: str,
     sdk_cost: dict | None,
     duration: float,
+    iter_start_utc: str = "",
+    iter_end_utc: str = "",
 ):
-    """Log cost to COST_LOG."""
+    """Log cost to COST_LOG. Actual USD is backfilled by reconciliation."""
     usd = sdk_cost["usd"] if sdk_cost else 0.0
     tokens_in = sdk_cost.get("tokens_in", 0) if sdk_cost else 0
     tokens_out = sdk_cost.get("tokens_out", 0) if sdk_cost else 0
@@ -617,10 +789,12 @@ def log_cost(
     session.sql(f"""
         INSERT INTO AUTO_FEATURE_ENG.CREDIT_RISK.COST_LOG
         (ITERATION_ID, RUN_ID, PHASE, SDK_COST_USD, CREDITS_WAREHOUSE,
-         CREDITS_TOTAL, SDK_TOKENS_IN, SDK_TOKENS_OUT, DURATION_SEC)
+         CREDITS_TOTAL, SDK_TOKENS_IN, SDK_TOKENS_OUT, DURATION_SEC,
+         ITER_START_TS, ITER_END_TS, RECONCILED)
         VALUES (
             {iteration}, '{run_id}', 'total',
-            {usd}, 0, {usd}, {tokens_in}, {tokens_out}, {duration}
+            {usd}, 0, {usd}, {tokens_in}, {tokens_out}, {duration},
+            '{iter_start_utc}'::TIMESTAMP_NTZ, '{iter_end_utc}'::TIMESTAMP_NTZ, FALSE
         )
     """).collect()
 
@@ -629,7 +803,7 @@ def log_cost(
 # Main loop
 # ---------------------------------------------------------------------------
 
-async def run_loop(config: dict, resume: bool = False):
+async def run_loop(config: dict, resume: bool = False, verbosity: str = "normal", live: bool = True):
     """Main orchestration loop."""
     project_dir = Path(__file__).parent
     run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -637,80 +811,100 @@ async def run_loop(config: dict, resume: bool = False):
     if resume:
         state = load_state("__resume__")
         run_id = state["run_id"]
-        print(f"Resuming run: {run_id} at iteration {state['current_iter']}")
     else:
         state = load_state(run_id)
         state["run_id"] = run_id
-        print(f"Starting new run: {run_id}")
 
-    # Ensure all Snowflake objects exist (idempotent, runs every time)
+    # Initialize logging
+    logger = setup_logging(run_id, verbosity)
+
+    if resume:
+        logger.info(f"Resuming run: {run_id} at iteration {state['current_iter']}")
+    else:
+        logger.info(f"Starting new run: {run_id}")
+
+    # Initialize monitor
+    max_iter = config["loop"]["max_iterations"]
+    monitor = LoopMonitor(run_id, max_iter, config["cost"]["max_cost_usd"], enabled=live) \
+        if HAS_RICH and live else _NoOpMonitor()
+
+    # One session for the full run; client_store_temporary_credential caches
+    # the SSO token so browser auth is not triggered on each SDK iteration.
     session = create_session(config)
     try:
+        # Ensure all Snowflake objects exist (idempotent)
+        monitor.update(phase="infrastructure")
         ensure_infrastructure(session, config)
-    finally:
-        session.close()
 
-    # Establish baseline if first run (short-lived session)
-    if state["baseline_auc"] == 0.0:
-        print("\n--- Establishing baseline ---")
-        session = create_session(config)
-        try:
-            session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}'").collect()
+        session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}'").collect()
+
+        # Establish baseline if first run
+        if state["baseline_auc"] == 0.0:
+            logger.info("Establishing baseline...")
+            monitor.update(phase="baseline")
+            t_phase = time.time()
             baseline = train_and_evaluate(
                 session, "AUTO_FEATURE_ENG.CREDIT_RISK.RAW_CREDIT_DATA", -1, run_id
             )
             state["baseline_auc"] = baseline["auc"]
             state["best_auc"] = baseline["auc"]
-            print(f"  Baseline AUC: {baseline['auc']:.6f}")
+            logger.info(f"Baseline AUC: {baseline['auc']:.6f} ({time.time()-t_phase:.1f}s)")
             save_state(state)
-        finally:
-            session.close()
 
-    max_iter = config["loop"]["max_iterations"]
-    print(f"\n{'='*60}")
-    print(f"  AUTO FEATURE ENGINEERING LOOP")
-    print(f"  Baseline AUC: {state['baseline_auc']:.6f}")
-    print(f"  Max iterations: {max_iter}")
-    print(f"  Cost ceiling: ${config['cost']['max_cost_usd']:.2f}")
-    print(f"{'='*60}\n")
+        monitor.update(best_auc=state["best_auc"], best_iter=state.get("best_iter", -1))
 
-    for i in range(state["current_iter"], max_iter):
-        print(f"\n{'─'*60}")
-        print(f"  ITERATION {i+1}/{max_iter}")
-        print(f"  Best AUC: {state['best_auc']:.6f} | Stale: {state['stale_count']}")
-        print(f"{'─'*60}")
-        t0 = time.time()
-        sdk_cost = None
+        logger.info(
+            f"LOOP START | baseline={state['baseline_auc']:.6f} "
+            f"| max_iter={max_iter} | ceiling=${config['cost']['max_cost_usd']:.2f}"
+        )
 
-        # Phase 1: SDK inference — no Snowpark session needed.
-        # The SDK manages its own connection internally.
-        print("  [Phase 1] Feature ideation (Cortex Code Agent SDK)...")
-        try:
-            feature_spec, sdk_cost = await ideate_features(i, state, config, project_dir)
-            print(f"  [Phase 1] Got {len(feature_spec.get('features', []))} features, strategy: {feature_spec.get('strategy', '?')}")
-        except Exception as e:
-            print(f"  ✗ CRASH in ideation: {e}")
-            feature_spec = None
+        monitor.start()
 
-        # Phases 2-6: Snowpark session for SQL operations.
-        # Session is created after inference completes and closed at end of iteration.
-        session = create_session(config)
-        try:
-            session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}'").collect()
+        for i in range(state["current_iter"], max_iter):
+            t0 = time.time()
+            iter_start_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            sdk_cost = None
+            monitor.update(current_iter=i + 1, phase="Ideation (SDK)", iter_start=time.time())
 
+            logger.info(
+                f"--- ITERATION {i+1}/{max_iter} | best={state['best_auc']:.6f} "
+                f"| stale={state['stale_count']} ---"
+            )
+
+            # Phase 1: SDK inference
+            t_phase = time.time()
+            try:
+                feature_spec, sdk_cost = await ideate_features(i, state, config, project_dir)
+                n_feats = len(feature_spec.get("features", []))
+                strategy = feature_spec.get("strategy", "?")
+                logger.info(
+                    f"[Phase 1] Ideation complete: {n_feats} features, "
+                    f"strategy={strategy} ({time.time()-t_phase:.1f}s)"
+                )
+            except Exception as e:
+                logger.error(f"[Phase 1] CRASH in ideation ({time.time()-t_phase:.1f}s): {e}")
+                feature_spec = None
+
+            # Phases 2-6: Use the shared session for SQL operations
             if feature_spec is None:
-                # Ideation failed — log crash and continue
                 log_iteration(session, i, run_id, None, None, "crash", state, "Ideation failed")
+                monitor.add_history(i, "crash", 0.0, "failed")
             else:
                 try:
                     # 2. DETERMINISTIC: Execute feature CTAS
-                    print("  [Phase 2] Executing feature SQL...")
+                    t_phase = time.time()
+                    monitor.update(phase="SQL execution")
                     feat_table = execute_features(session, feature_spec, i, config)
+                    logger.info(f"[Phase 2] Feature table created ({time.time()-t_phase:.1f}s)")
 
                     # 3. DETERMINISTIC: Train and evaluate
-                    print("  [Phase 3] Training model...")
+                    t_phase = time.time()
+                    monitor.update(phase="Training")
                     metrics = train_and_evaluate(session, feat_table, i, run_id)
-                    print(f"  [Phase 3] AUC: {metrics['auc']:.6f} (delta: {metrics['auc'] - state['best_auc']:+.6f})")
+                    delta = metrics["auc"] - state["best_auc"]
+                    logger.info(
+                        f"[Phase 3] AUC={metrics['auc']:.6f} (delta={delta:+.6f}) ({time.time()-t_phase:.1f}s)"
+                    )
 
                     # 4. DETERMINISTIC: Decision
                     status = decide(metrics, state, config)
@@ -721,50 +915,70 @@ async def run_loop(config: dict, resume: bool = False):
                         strategy = feature_spec.get("strategy", "")
                         if strategy and strategy not in state["tried_categories"]:
                             state["tried_categories"].append(strategy)
-                        print(f"  ✓ KEEP — new best AUC: {metrics['auc']:.6f}")
+                        logger.warning(f"KEEP — new best AUC: {metrics['auc']:.6f}")
+                        monitor.update(best_auc=metrics["auc"], best_iter=i, stale_count=0)
                     else:
                         state["stale_count"] += 1
-                        print(f"  ✗ DISCARD — no improvement (stale: {state['stale_count']})")
+                        logger.warning(f"DISCARD — no improvement (stale: {state['stale_count']})")
+                        monitor.update(stale_count=state["stale_count"])
+
+                    monitor.add_history(i, status, metrics["auc"], feature_spec.get("strategy", "")[:12])
 
                     # 5. Log success
                     log_iteration(session, i, run_id, feature_spec, metrics, status, state)
 
                 except Exception as e:
-                    print(f"  ✗ CRASH: {e}")
+                    logger.error(f"CRASH in phases 2-4: {e}")
                     log_iteration(session, i, run_id, None, None, "crash", state, str(e)[:500])
+                    monitor.add_history(i, "crash", 0.0, "error")
 
             # 6. Log cost (always, including on crash)
             duration = time.time() - t0
-            log_cost(session, i, run_id, sdk_cost, duration)
+            iter_end_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            log_cost(session, i, run_id, sdk_cost, duration, iter_start_utc, iter_end_utc)
+            logger.info(f"[Cost] Iteration duration: {duration:.1f}s | SDK: ${sdk_cost['usd']:.4f}" if sdk_cost else f"[Cost] Iteration duration: {duration:.1f}s")
 
-        finally:
-            session.close()
+            # Track cumulative cost
+            if sdk_cost:
+                state["total_cost_usd"] = state.get("total_cost_usd", 0) + sdk_cost["usd"]
+            monitor.update(cost_usd=state["total_cost_usd"])
 
-        # Track cumulative cost
-        if sdk_cost:
-            state["total_cost_usd"] = state.get("total_cost_usd", 0) + sdk_cost["usd"]
+            # 7. Check cost ceiling
+            if state["total_cost_usd"] > config["cost"]["max_cost_usd"]:
+                logger.warning(
+                    f"COST CEILING REACHED (${state['total_cost_usd']:.2f} > "
+                    f"${config['cost']['max_cost_usd']:.2f}). Stopping."
+                )
+                break
 
-        # 7. Check cost ceiling
-        if state["total_cost_usd"] > config["cost"]["max_cost_usd"]:
-            print(f"\n  COST CEILING REACHED (${state['total_cost_usd']:.2f} > ${config['cost']['max_cost_usd']:.2f}). Stopping.")
-            break
+            # 8. Persist state
+            state["current_iter"] = i + 1
+            save_state(state)
 
-        # 8. Persist state
-        state["current_iter"] = i + 1
-        save_state(state)
+        monitor.stop()
 
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"  RUN COMPLETE: {run_id}")
-    print(f"  Baseline AUC: {state['baseline_auc']:.6f}")
-    print(f"  Best AUC:     {state['best_auc']:.6f} (iter {state['best_iter']})")
-    print(f"  Improvement:  {state['best_auc'] - state['baseline_auc']:+.6f}")
-    print(f"  Total cost:   ${state['total_cost_usd']:.4f}")
-    print(f"{'='*60}")
+        # Summary
+        logger.info(
+            f"RUN COMPLETE: {run_id} | baseline={state['baseline_auc']:.6f} "
+            f"| best={state['best_auc']:.6f} (iter {state['best_iter']}) "
+            f"| improvement={state['best_auc'] - state['baseline_auc']:+.6f} "
+            f"| cost=${state['total_cost_usd']:.4f}"
+        )
 
-    # Finalize: register best model and feature view
-    if state["best_iter"] >= 0:
-        finalize_run(state, config)
+        # Finalize: register best model and feature view
+        if state["best_iter"] >= 0:
+            finalize_run(session, state, config)
+
+        # Attempt cost reconciliation (may be partial due to ACCOUNT_USAGE latency)
+        from utils.cost_tracker import reconcile_run
+        credit_rate = config["cost"]["credit_rate_usd"]
+        logger.info("[Reconcile] Attempting cost reconciliation from ACCOUNT_USAGE...")
+        reconcile_run(session, state["run_id"], credit_rate)
+        logger.info("[Reconcile] Note: ACCOUNT_USAGE has 45min-3hr latency. Re-run reconciliation later for full data.")
+
+    finally:
+        monitor.stop()
+        session.close()
 
     return state
 
@@ -773,39 +987,41 @@ async def run_loop(config: dict, resume: bool = False):
 # Finalization: Feature Store + Model Registry
 # ---------------------------------------------------------------------------
 
-def finalize_run(state: dict, config: dict):
+def finalize_run(session: Session, state: dict, config: dict):
     """
     Post-loop finalization:
     1. Re-train on best iteration's table with REGISTER_MODEL=TRUE (registers in Model Registry)
     2. Register winning features in Snowflake Feature Store as an external Feature View
     """
+    logger = logging.getLogger("auto_fe")
     db = config["snowflake"]["database"]
     schema = config["snowflake"]["schema"]
     run_id = state["run_id"]
     best_iter = state["best_iter"]
     best_table = f"{db}.{schema}.FEATURES_ITER_{best_iter}"
 
-    print(f"\n{'─'*60}")
-    print(f"  FINALIZATION: Model Registry + Feature Store")
-    print(f"  Best iteration: {best_iter} (AUC: {state['best_auc']:.6f})")
-    print(f"  Feature table: {best_table}")
-    print(f"{'─'*60}")
+    logger.info(
+        f"[Finalize] Starting: iter={best_iter}, AUC={state['best_auc']:.6f}, table={best_table}"
+    )
 
-    session = create_session(config)
     try:
         session.sql(f"ALTER SESSION SET QUERY_TAG = '{run_id}_finalize'").collect()
 
         # --- Step 1: Register model via SP with REGISTER_MODEL=TRUE ---
-        print("\n  [Registry] Training final model and registering in Model Registry...")
+        t_phase = time.time()
+        logger.info("[Registry] Training final model and registering in Model Registry...")
         final_metrics = train_and_evaluate(
             session, best_table, best_iter, run_id, register_model=True
         )
         model_version = final_metrics.get("model_version", "unknown")
-        print(f"  [Registry] Model registered: CREDIT_RISK_XGBOOST version {model_version}")
-        print(f"  [Registry] AUC: {final_metrics['auc']:.6f}")
+        logger.info(
+            f"[Registry] Model registered: CREDIT_RISK_XGBOOST v{model_version} "
+            f"| AUC={final_metrics['auc']:.6f} ({time.time()-t_phase:.1f}s)"
+        )
 
         # --- Step 2: Register winning features in Feature Store ---
-        print("\n  [Feature Store] Registering winning features...")
+        t_phase = time.time()
+        logger.info("[Feature Store] Registering winning features...")
 
         # Ensure feature store schema exists
         session.sql(f"CREATE SCHEMA IF NOT EXISTS {db}.FEATURE_STORE").collect()
@@ -851,23 +1067,19 @@ def finalize_run(state: dict, config: dict):
             version=fv_version,
             block=True,
         )
-        print(f"  [Feature Store] Feature View registered: CREDIT_RISK_BEST_FV version {fv_version}")
+        logger.info(
+            f"[Feature Store] Registered: CREDIT_RISK_BEST_FV v{fv_version} ({time.time()-t_phase:.1f}s)"
+        )
 
         # --- Summary ---
-        print(f"\n  {'─'*56}")
-        print(f"  FINALIZATION COMPLETE")
-        print(f"  Model:        AUTO_FEATURE_ENG.CREDIT_RISK.CREDIT_RISK_XGBOOST v{model_version}")
-        print(f"  Feature View: AUTO_FEATURE_ENG.FEATURE_STORE.CREDIT_RISK_BEST_FV v{fv_version}")
-        print(f"  {'─'*56}")
-        print(f"\n  Inference example:")
-        print(f"    SELECT MODEL(AUTO_FEATURE_ENG.CREDIT_RISK.CREDIT_RISK_XGBOOST, {model_version})!PREDICT(*)")
-        print(f"    FROM {best_table} LIMIT 10;")
+        logger.info(
+            f"[Finalize] COMPLETE | Model: CREDIT_RISK_XGBOOST v{model_version} "
+            f"| FV: CREDIT_RISK_BEST_FV v{fv_version}"
+        )
 
     except Exception as e:
-        print(f"  [Finalize] ERROR: {e}")
-        print("  The loop results are still valid — finalization can be retried.")
-    finally:
-        session.close()
+        logger.error(f"[Finalize] ERROR: {e}")
+        logger.info("The loop results are still valid — finalization can be retried.")
 
 
 # ---------------------------------------------------------------------------
@@ -879,13 +1091,27 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show agent reasoning and SQL (DEBUG level)")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Only show decisions and errors (WARNING level)")
+    parser.add_argument("--no-live", action="store_true",
+                        help="Disable rich status panel (for CI/pipes/nohup)")
     args = parser.parse_args()
 
     config = load_config(Path(__file__).parent / args.config)
     if args.max_iterations:
         config["loop"]["max_iterations"] = args.max_iterations
 
-    asyncio.run(run_loop(config, resume=args.resume))
+    # Determine verbosity
+    if args.verbose:
+        verbosity = "verbose"
+    elif args.quiet:
+        verbosity = "quiet"
+    else:
+        verbosity = "normal"
+
+    asyncio.run(run_loop(config, resume=args.resume, verbosity=verbosity, live=not args.no_live))
 
 
 if __name__ == "__main__":

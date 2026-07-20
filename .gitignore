@@ -17,6 +17,8 @@ venv/
 dashboard/node_modules/
 dashboard/.next/
 dashboard/out/
+dashboard/.env.local
+dashboard/snowflake.log
 *.tsbuildinfo
 
 # IDE
@@ -30,6 +32,9 @@ Thumbs.db
 
 # Snowflake CLI cache
 .snowflake/
+
+# Logs (runtime output)
+logs/
 
 # Matplotlib output
 *.png
